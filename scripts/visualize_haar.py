@@ -3,7 +3,8 @@ import os
 
 import numpy as np
 import torch
-from PIL import Image
+import torch.nn.functional as F
+from PIL import Image, ImageOps
 from pytorch_wavelets import DWTForward
 from torchvision import transforms
 
@@ -37,9 +38,49 @@ def to_gray_uint8(tensor, signed=False):
     return norm.clamp(0, 255).byte().numpy()
 
 
+def colorize_signed(gray_img, neg=(52, 96, 242), zero=(34, 34, 34), pos=(242, 88, 52)):
+    """Map signed detail maps to a diverging color ramp (neg->zero->pos)."""
+    pil_img = Image.fromarray(gray_img, mode="L")
+    colored = ImageOps.colorize(pil_img, black=neg, mid=zero, white=pos)
+    return np.array(colored)
+
+
+def colorize_unsigned(gray_img, low=(14, 31, 74), mid=(42, 163, 177), high=(255, 230, 92)):
+    """Map unsigned maps to a sequential color ramp (low->mid->high)."""
+    pil_img = Image.fromarray(gray_img, mode="L")
+    colored = ImageOps.colorize(pil_img, black=low, mid=mid, white=high)
+    return np.array(colored)
+
+
+def make_attention_overlay(rgb_img, attention_gray, max_alpha=0.65):
+    """Overlay attention heatmap on RGB image so high-response regions stand out."""
+    heatmap = colorize_unsigned(
+        attention_gray,
+        low=(17, 44, 92),
+        mid=(245, 171, 53),
+        high=(225, 55, 36),
+    ).astype(np.float32)
+
+    base = rgb_img.astype(np.float32)
+    alpha = (attention_gray.astype(np.float32) / 255.0) * float(max_alpha)
+    alpha = alpha[..., None]
+    overlay = base * (1.0 - alpha) + heatmap * alpha
+    return np.clip(overlay, 0, 255).astype(np.uint8)
+
+
 def make_grid(ll_img, lh_img, hl_img, hh_img):
     h, w = ll_img.shape
     canvas = np.zeros((h * 2, w * 2), dtype=np.uint8)
+    canvas[0:h, 0:w] = ll_img
+    canvas[0:h, w:2 * w] = lh_img
+    canvas[h:2 * h, 0:w] = hl_img
+    canvas[h:2 * h, w:2 * w] = hh_img
+    return canvas
+
+
+def make_grid_color(ll_img, lh_img, hl_img, hh_img):
+    h, w, _ = ll_img.shape
+    canvas = np.zeros((h * 2, w * 2, 3), dtype=np.uint8)
     canvas[0:h, 0:w] = ll_img
     canvas[0:h, w:2 * w] = lh_img
     canvas[h:2 * h, 0:w] = hl_img
@@ -58,6 +99,12 @@ def main():
         help="Optional resize as 'height,width', e.g. 480,720",
     )
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], help="Compute device")
+    parser.add_argument(
+        "--attention_alpha",
+        type=float,
+        default=0.65,
+        help="Max alpha for attention overlay blending in [0, 1]",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.image):
@@ -90,12 +137,42 @@ def main():
     hh_img = to_gray_uint8(hh, signed=True)
     grid_img = make_grid(ll_img, lh_img, hl_img, hh_img)
 
+    ll_color = colorize_unsigned(ll_img)
+    lh_color = colorize_signed(lh_img)
+    hl_color = colorize_signed(hl_img)
+    hh_color = colorize_signed(hh_img)
+    grid_color = make_grid_color(ll_color, lh_color, hl_color, hh_color)
+
+    # Attention-style summary: combine LH/HL/HH energy and overlay on input image.
+    detail_energy = torch.sqrt((lh ** 2).mean(dim=0) + (hl ** 2).mean(dim=0) + (hh ** 2).mean(dim=0))
+    detail_energy = detail_energy.unsqueeze(0).unsqueeze(0)
+    detail_energy = F.interpolate(
+        detail_energy,
+        size=(x.shape[-2], x.shape[-1]),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0).squeeze(0)
+    attention_gray = to_gray_uint8(detail_energy, signed=False)
+    base_rgb = np.array(image)
+    attention_overlay = make_attention_overlay(
+        base_rgb,
+        attention_gray,
+        max_alpha=float(np.clip(args.attention_alpha, 0.0, 1.0)),
+    )
+
     os.makedirs(args.output_dir, exist_ok=True)
     Image.fromarray(ll_img, mode="L").save(os.path.join(args.output_dir, "LL_low_freq.png"))
     Image.fromarray(lh_img, mode="L").save(os.path.join(args.output_dir, "LH_horizontal_detail.png"))
     Image.fromarray(hl_img, mode="L").save(os.path.join(args.output_dir, "HL_vertical_detail.png"))
     Image.fromarray(hh_img, mode="L").save(os.path.join(args.output_dir, "HH_diagonal_detail.png"))
     Image.fromarray(grid_img, mode="L").save(os.path.join(args.output_dir, "haar_components_grid.png"))
+    Image.fromarray(ll_color, mode="RGB").save(os.path.join(args.output_dir, "LL_low_freq_color.png"))
+    Image.fromarray(lh_color, mode="RGB").save(os.path.join(args.output_dir, "LH_horizontal_detail_color.png"))
+    Image.fromarray(hl_color, mode="RGB").save(os.path.join(args.output_dir, "HL_vertical_detail_color.png"))
+    Image.fromarray(hh_color, mode="RGB").save(os.path.join(args.output_dir, "HH_diagonal_detail_color.png"))
+    Image.fromarray(grid_color, mode="RGB").save(os.path.join(args.output_dir, "haar_components_grid_color.png"))
+    Image.fromarray(attention_gray, mode="L").save(os.path.join(args.output_dir, "detail_attention_gray.png"))
+    Image.fromarray(attention_overlay, mode="RGB").save(os.path.join(args.output_dir, "detail_attention_overlay.png"))
 
     print("Saved wavelet component visualizations:")
     print(os.path.join(args.output_dir, "LL_low_freq.png"))
@@ -103,6 +180,13 @@ def main():
     print(os.path.join(args.output_dir, "HL_vertical_detail.png"))
     print(os.path.join(args.output_dir, "HH_diagonal_detail.png"))
     print(os.path.join(args.output_dir, "haar_components_grid.png"))
+    print(os.path.join(args.output_dir, "LL_low_freq_color.png"))
+    print(os.path.join(args.output_dir, "LH_horizontal_detail_color.png"))
+    print(os.path.join(args.output_dir, "HL_vertical_detail_color.png"))
+    print(os.path.join(args.output_dir, "HH_diagonal_detail_color.png"))
+    print(os.path.join(args.output_dir, "haar_components_grid_color.png"))
+    print(os.path.join(args.output_dir, "detail_attention_gray.png"))
+    print(os.path.join(args.output_dir, "detail_attention_overlay.png"))
 
 
 if __name__ == "__main__":
