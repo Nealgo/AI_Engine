@@ -119,7 +119,7 @@ def parse_args():
                         help='Image size for training (height,width)')
     
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size for training')
     parser.add_argument('--num_epochs', type=int, default=1000,
                         help='Number of training epochs')

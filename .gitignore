@@ -1,0 +1,9 @@
+# Ignore WDNet weight files
+wdnet*.pth
+
+# Ignore dataset directory contents
+datas/
+
+# Ignore Python cache files
+__pycache__/
+*/__pycache__/

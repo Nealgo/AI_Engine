@@ -1,5 +1,7 @@
 import os
 import random
+import glob
+import re
 from PIL import Image
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
@@ -16,31 +18,48 @@ class DerainDataset(Dataset):
         # 生成图像对列表
         image_pairs = []
         if self.split == 'train':
-            # 如果是训练集，设置对应的子目录和索引范围
+            # 如果是训练集，设置对应的子目录
             data_subdir = 'data_train'
             gt_subdir = 'gt_train'
-            index_range = range(0, 9)
         elif self.split == 'test':
-            # 如果是测试集，设置对应的子目录和索引范围
+            # 如果是测试集，设置对应的子目录
             data_subdir = 'data_test'
             gt_subdir = 'gt_test'
-            index_range = range(0, 2)
         else:
             # 如果分割类型不是'train'或'test'，抛出异常
             raise ValueError("Invalid split name, expected 'train' or 'test'")
 
-        for i in index_range:
-            # 构建带雨图像和干净图像的路径
-            rain_image_path = os.path.join(self.data_dir, 'data', data_subdir, f'{i}_rain.png')
-            clean_image_path = os.path.join(self.data_dir, 'gt', gt_subdir, f'{i}_clean.png')
-            if os.path.exists(rain_image_path) and os.path.exists(clean_image_path):
-                # 如果图像文件存在，添加到图像对列表
+        rain_pattern = os.path.join(self.data_dir, 'data', data_subdir, '*_rain.png')
+        rain_files = sorted(glob.glob(rain_pattern), key=self._numeric_key)
+
+        if not rain_files:
+            raise FileNotFoundError(f"No rain images found under: {rain_pattern}")
+
+        for rain_image_path in rain_files:
+            filename = os.path.basename(rain_image_path)
+            match = re.match(r'^(\d+)_rain\.png$', filename)
+            if not match:
+                continue
+
+            idx = match.group(1)
+            clean_image_path = os.path.join(self.data_dir, 'gt', gt_subdir, f'{idx}_clean.png')
+            if os.path.exists(clean_image_path):
                 image_pairs.append((rain_image_path, clean_image_path))
             else:
-                # 如果图像文件不存在，抛出文件未找到异常
-                raise FileNotFoundError(f"Files not found: {rain_image_path}, {clean_image_path}")
+                raise FileNotFoundError(f"Missing clean image for {rain_image_path}: {clean_image_path}")
+
+        if not image_pairs:
+            raise FileNotFoundError(
+                f"No valid image pairs found under data/{data_subdir} and gt/{gt_subdir}"
+            )
 
         return image_pairs  # 返回图像对列表
+
+    @staticmethod
+    def _numeric_key(path):
+        name = os.path.basename(path)
+        match = re.match(r'^(\d+)_rain\.png$', name)
+        return int(match.group(1)) if match else float('inf')
 
     def __len__(self):
         # 返回数据集中图像对的数量
