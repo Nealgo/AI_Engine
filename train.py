@@ -10,6 +10,7 @@ import csv
 import argparse
 from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim
 import numpy as np
+from torch.cuda.amp import autocast, GradScaler
 from model.wdnet import WDNet
 import torchvision.models as models
 from dataLoader import DerainDataset
@@ -102,10 +103,12 @@ class CombinedLoss(nn.Module):
         super(CombinedLoss, self).__init__()
         self.alpha = alpha
         self.l1_loss = nn.L1Loss()
-        self.perceptual_loss = PerceptualLoss(vgg_model=vgg_model, device=device)
+        self.perceptual_loss = None if alpha >= 1.0 else PerceptualLoss(vgg_model=vgg_model, device=device)
 
     def forward(self, input, target):
         l1_loss_value = self.l1_loss(input, target)
+        if self.perceptual_loss is None:
+            return l1_loss_value
         perceptual_loss_value = self.perceptual_loss(input, target)
         return self.alpha * l1_loss_value + (1 - self.alpha) * perceptual_loss_value
 
@@ -119,9 +122,9 @@ def parse_args():
                         help='Image size for training (height,width)')
     
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size for training')
-    parser.add_argument('--num_epochs', type=int, default=1000,
+    parser.add_argument('--num_epochs', type=int, default=100,
                         help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-3,
                         help='Initial learning rate')
@@ -152,22 +155,24 @@ def parse_args():
     
     return parser.parse_args()
 
-def train_epoch(model, train_loader, optimizer, criterion, recent_losses, max_loss_threshold):
+def train_epoch(model, train_loader, optimizer, criterion, recent_losses, max_loss_threshold, scaler, use_amp):
     model.train()
     running_loss = 0.0
     
     for i, (rain_images, clean_images) in enumerate(tqdm(train_loader)):
         rain_images, clean_images = rain_images.to(device), clean_images.to(device)
-        optimizer.zero_grad()
-        predicted_clean_image = model(rain_images)
-        loss = criterion(predicted_clean_image, clean_images)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(enabled=use_amp):
+            predicted_clean_image = model(rain_images)
+            loss = criterion(predicted_clean_image, clean_images)
         
         if loss.item() > max_loss_threshold:
             print(f"\nLoss explosion detected: {loss.item():.4f}")
             return None, True
         
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         running_loss += loss.item()
         
         recent_losses.append(loss.item())
@@ -181,7 +186,7 @@ def train_epoch(model, train_loader, optimizer, criterion, recent_losses, max_lo
                 
     return running_loss / len(train_loader), False
 
-def test_model(model, test_loader):
+def test_model(model, test_loader, use_amp):
     model.eval()
     total_psnr, total_ssim = 0.0, 0.0
     num_images = 0
@@ -189,7 +194,8 @@ def test_model(model, test_loader):
     with torch.no_grad():
         for rain_images, clean_images in tqdm(test_loader, desc='Testing'):
             rain_images, clean_images = rain_images.to(device), clean_images.to(device)
-            output = model(rain_images)
+            with autocast(enabled=use_amp):
+                output = model(rain_images)
             denorm_output = denormalize(output[0], mean=Mean, std=Std)
             denorm_clean = denormalize(clean_images[0], mean=Mean, std=Std)
             psnr_value, ssim_value = calculate_metrics(denorm_output, denorm_clean)
@@ -255,6 +261,8 @@ if __name__ == "__main__":
     # Initialize model, loss function
     model = WDNet().to(device)
     criterion = CombinedLoss(alpha=args.alpha, vgg_model=args.vgg_model, device=device)
+    use_amp = device.type == 'cuda'
+    scaler = GradScaler(enabled=use_amp)
     
     # Load datasets
     train_dataset = DerainDataset(data_dir=args.data_dir, split='train', transform=transform)
@@ -286,12 +294,22 @@ if __name__ == "__main__":
     print(f"Model Path: {args.model_path}")
     print(f"Max Loss Threshold: {args.max_loss}")
     print(f"Loss Patience: {args.loss_patience}")
+    print(f"Mixed Precision: {use_amp}")
     
     for epoch in range(args.num_epochs):
         print(f"\nEpoch {epoch+1}/{args.num_epochs}")
         
         # Train one epoch
-        avg_train_loss, loss_exploded = train_epoch(model, train_loader, optimizer, criterion, recent_losses, args.max_loss)
+        avg_train_loss, loss_exploded = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            recent_losses,
+            args.max_loss,
+            scaler,
+            use_amp,
+        )
         
         # If loss exploded, restart training from last best model
         if loss_exploded:
@@ -305,7 +323,7 @@ if __name__ == "__main__":
                 break
         
         # Test and evaluate
-        avg_psnr, avg_ssim = test_model(model, test_loader)
+        avg_psnr, avg_ssim = test_model(model, test_loader, use_amp)
         current_lr = optimizer.param_groups[0]['lr']
         
         # Save training log
