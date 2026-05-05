@@ -185,137 +185,20 @@ class DeformConvTranspose2d(nn.Module):
         
         return out
 
-class DynamicReLUIdentity2d(nn.Module):
-    def __init__(self, channels, reduction_ratio=16):
-        super().__init__()
-        self.channels = channels
-        
-        # 通道级动态权重
-        self.channel_weight = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),  # 全局平均池化
-            nn.Conv2d(channels, channels // reduction_ratio, kernel_size=1),  # 降维
-            nn.ReLU(),
-            nn.Conv2d(channels // reduction_ratio, channels, kernel_size=1),  # 升维
-            nn.Sigmoid()  # 权重限制在 [0, 1]
-        )
-        
-        # 空间感知的动态权重
-        self.spatial_weight = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction_ratio, kernel_size=1),  # 降维
-            nn.ReLU(),
-            nn.Conv2d(channels // reduction_ratio, 1, kernel_size=1),  # 输出单通道权重图
-            nn.Sigmoid()  # 权重限制在 [0, 1]
-        )
-        
-        # 归一化层
-        self.norm = nn.GroupNorm(num_groups=16, num_channels=channels)  # GroupNorm 更适合图像任务
-
-    def forward(self, x):
-        x_norm = self.norm(x)  # 归一化输入
-        
-        # 通道级动态权重
-        channel_weight = self.channel_weight(x_norm)  # [B, C, 1, 1]
-        # 空间感知的动态权重
-        spatial_weight = self.spatial_weight(x_norm)  # [B, 1, H, W]
-        # 综合权重
-        weight = channel_weight * spatial_weight  # [B, C, H, W]
-        # 动态混合 ReLU 和恒等映射
-        relu_out = F.relu(x)
-        identity_out = x
-        output = weight * relu_out + (1 - weight) * identity_out
-        
-        return output
-        
-class AdaptivePConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, partial_ratio=0.25, stride=1, padding=1, bias=True):
-        super(AdaptivePConv, self).__init__()
-        
-        self.in_channels = in_channels
-        self.partial_channels = int(in_channels * partial_ratio)
-        
-        # 卷积层
-        self.conv = nn.Conv2d(self.partial_channels, out_channels, 
-                             kernel_size=kernel_size, 
-                             stride=stride, 
-                             padding=padding, 
-                             bias=bias)
-        
-    def forward(self, x):
-        batch_size = x.size(0)
-        
-        # 计算每个通道的活跃度 (使用标准差作为度量)
-        channel_activity = torch.std(x, dim=(2, 3))  # [B, C]
-        
-        # 选择活跃度最高的 partial_channels 个通道的索引
-        _, top_indices = torch.topk(channel_activity, self.partial_channels, dim=1)
-        
-        # 为每个批次样本收集重要通道
-        partial_outputs = []
-        untouched_outputs = []
-        
-        for i in range(batch_size):
-            # 获取当前样本的活跃通道
-            selected_channels = x[i, top_indices[i], :, :]
-            selected_channels = selected_channels.unsqueeze(0)
-            
-            # 对选中的通道进行卷积
-            partial_out = self.conv(selected_channels)
-            partial_outputs.append(partial_out)
-            
-            # 获取未选中的通道
-            mask = torch.ones(self.in_channels, device=x.device)
-            mask[top_indices[i]] = 0
-            unselected_indices = mask.nonzero().squeeze()
-            untouched_channels = x[i, unselected_indices, :, :]
-            untouched_channels = untouched_channels.unsqueeze(0)
-            
-            untouched_outputs.append(untouched_channels)
-        
-        # 将所有批次的输出组合
-        partial_output = torch.cat(partial_outputs, dim=0)
-        untouched_output = torch.cat(untouched_outputs, dim=0)
-        
-        # 拼接处理过的和未处理的通道
-        out = torch.cat((partial_output, untouched_output), dim=1)
-        
-        return out
-
-class DepthwiseSeparableConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False):
-        super(DepthwiseSeparableConv, self).__init__()
-        # 深度卷积：在每个通道上单独应用卷积，不跨通道
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, stride=stride, 
-                                   padding=padding, groups=in_channels, bias=bias)
-        # 逐点卷积：1x1 卷积用于通道之间的线性组合
-        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=bias)
-
-    def forward(self, x):
-        # 深度卷积
-        x = self.depthwise(x)
-        # 逐点卷积
-        x = self.pointwise(x)
-        return x
-
 class WDNet(nn.Module):
     def __init__(self, in_channels=3, out_channels=3):
         super(WDNet, self).__init__()
 
-        # Encoder
+        # Encoder (使用核心小波注意力提取器)
         self.encoder1 = RainDropFeatureExtractor(in_channels, 64)
         self.encoder2 = RainDropFeatureExtractor(64, 128)
         self.encoder3 = RainDropFeatureExtractor(128, 256)
         self.encoder4 = RainDropFeatureExtractor(256, 512)
 
-        # Middle part
+        # Middle part (精简为标准的双重卷积模块)
+        self.middle = self.double_conv(512, 512)
         
-        self.middle = nn.Sequential(
-            DepthwiseSeparableConv(in_channels=512, out_channels=1024),
-            AdaptivePConv(1024, 512),
-            DynamicReLUIdentity2d(1280),
-            DepthwiseSeparableConv(in_channels=1280, out_channels=512),
-        )
-        
-        # Decoder
+        # Decoder (使用核心可变形转置卷积上采样)
         self.upconv4 = DeformConvTranspose2d(512, 256, kernel_size=3, stride=2, padding=1, output_padding=1)
         self.decoder4 = self.double_conv(256 + 256, 256)
         self.upconv3 = DeformConvTranspose2d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1)
